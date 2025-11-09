@@ -1,0 +1,225 @@
+# ============================================================
+# Education Assistant Prompt Library for Teachers & Students
+# (version: compatibility fixes for OneHotEncoder & RMSE)
+# ============================================================
+
+import os
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.impute import SimpleImputer
+import joblib
+
+# -------------------------------------------
+# Settings
+# -------------------------------------------
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+random.seed(RANDOM_STATE)
+
+OUTPUT_DIR = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# -------------------------------------------
+# 1. Generate synthetic dataset
+# -------------------------------------------
+def random_prompt_text(prompt_type, subject, grade):
+    templates = {
+        "question": [
+            "Explain why {} happens in {} for grade {}.",
+            "What are the main steps to solve a {} problem in {}?",
+            "Design a practice question on {} for grade {} students."
+        ],
+        "explanation": [
+            "Give a simple explanation of {} for grade {} learners with examples.",
+            "Summarize the concept of {} in 5 bullet points for grade {}."
+        ],
+        "quiz": [
+            "Create a 5-question quiz about {} for grade {}.",
+            "Design multiple choice questions on {} suitable for grade {}."
+        ],
+        "activity": [
+            "Suggest a hands-on activity about {} for grade {}.",
+            "Create a classroom activity that teaches {} to grade {} students."
+        ]
+    }
+    template = random.choice(templates[prompt_type])
+    return template.format(subject, subject, grade)
+
+subjects = ["Math", "Science", "English", "History", "Geography", "Computer Science"]
+prompt_types = ["question", "explanation", "quiz", "activity"]
+grades = list(range(1, 13))
+rows = []
+
+for i in range(2000):
+    subject = random.choice(subjects)
+    prompt_type = random.choice(prompt_types)
+    grade = random.choice(grades)
+    audience = random.choice(["teacher", "student"])
+    text = random_prompt_text(prompt_type, subject, grade)
+    random_words = " ".join(random.choices(["example", "hint", "practice", "challenge", "explain", "simple"], k=random.randint(0,4)))
+    full_text = text + " " + random_words
+    prompt_length = len(full_text)
+    
+    base_usefulness = {
+        "question": 0.6,
+        "explanation": 0.65,
+        "quiz": 0.7,
+        "activity": 0.75
+    }[prompt_type]
+
+    grade_factor = 0.05 if 6 <= grade <= 9 else -0.01
+    subject_factor = {
+        "Math": -0.02, "Science": 0.02, "English": 0.01,
+        "History": 0.0, "Geography": 0.0, "Computer Science": 0.03
+    }[subject]
+    audience_factor = 0.02 if audience == "teacher" else 0.0
+
+    engagement_score = min(max(np.random.normal(0.6 + grade_factor + subject_factor, 0.12), 0.0), 1.0)
+    usefulness_score = (base_usefulness + grade_factor + subject_factor + audience_factor) * 100
+    usefulness_score += (engagement_score - 0.6) * 30 + np.random.normal(0, 5)
+    usefulness_score = float(min(max(usefulness_score, 0.0), 100.0))
+
+    rows.append({
+        "prompt_id": f"P{i+1:05d}",
+        "prompt_text": full_text,
+        "prompt_type": prompt_type,
+        "subject": subject,
+        "grade": grade,
+        "audience": audience,
+        "prompt_length": prompt_length,
+        "engagement_score": engagement_score,
+        "usefulness_score": usefulness_score
+    })
+
+df = pd.DataFrame(rows)
+df.to_csv(os.path.join(OUTPUT_DIR, "synthetic_prompts.csv"), index=False)
+print("✅ Synthetic dataset created!")
+
+# -------------------------------------------
+# 2. Data Cleaning
+# -------------------------------------------
+df.drop_duplicates(subset="prompt_text", inplace=True)
+df.loc[df.sample(frac=0.01, random_state=RANDOM_STATE).index, "engagement_score"] = np.nan
+print("✅ Cleaned dataset — missing values introduced for demo.")
+
+# -------------------------------------------
+# 3. EDA
+# -------------------------------------------
+plt.figure(figsize=(8,4))
+plt.hist(df["usefulness_score"], bins=30)
+plt.title("Distribution of Usefulness Score")
+plt.xlabel("Usefulness Score")
+plt.ylabel("Count")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "usefulness_distribution.png"))
+plt.close()
+
+avg_by_type = df.groupby("prompt_type")["usefulness_score"].mean().sort_values()
+avg_by_type.plot.barh(title="Average Usefulness by Prompt Type", figsize=(8,4))
+plt.xlabel("Average Usefulness Score")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "avg_usefulness_by_type.png"))
+plt.close()
+
+print("✅ EDA complete. Plots saved in outputs/.")
+
+# -------------------------------------------
+# 4. Train/Test Split
+# -------------------------------------------
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=RANDOM_STATE)
+X_train = train_df.drop(columns=["prompt_id", "usefulness_score"])
+y_train = train_df["usefulness_score"]
+X_test = test_df.drop(columns=["prompt_id", "usefulness_score"])
+y_test = test_df["usefulness_score"]
+
+# -------------------------------------------
+# 5. Feature Engineering
+# -------------------------------------------
+num_features = ["grade", "prompt_length", "engagement_score"]
+cat_features = ["prompt_type", "subject", "audience"]
+text_feature = "prompt_text"
+
+num_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+# compatibility: use sparse_output=False instead of sparse=False
+cat_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+])
+
+text_pipeline = Pipeline([
+    ("tfidf", TfidfVectorizer(max_features=2000, ngram_range=(1,2))),
+    ("svd", TruncatedSVD(n_components=10, random_state=RANDOM_STATE))
+])
+
+preprocessor = ColumnTransformer([
+    ("num", num_pipeline, num_features),
+    ("cat", cat_pipeline, cat_features),
+    ("txt", text_pipeline, text_feature)
+], remainder="drop", sparse_threshold=0)
+
+# -------------------------------------------
+# 6. Model Training
+# -------------------------------------------
+model_pipeline = Pipeline([
+    ("preprocessor", preprocessor),
+    ("model", RandomForestRegressor(n_estimators=150, random_state=RANDOM_STATE, n_jobs=-1))
+])
+
+print("🚀 Training model...")
+model_pipeline.fit(X_train, y_train)
+print("✅ Model training complete!")
+
+# Save trained model
+model_path = os.path.join(OUTPUT_DIR, "rf_usefulness_model.joblib")
+joblib.dump(model_pipeline, model_path)
+
+# -------------------------------------------
+# 7. Evaluation (compatibility-safe RMSE)
+# -------------------------------------------
+y_pred = model_pipeline.predict(X_test)
+
+# Compute RMSE in a way that's compatible across sklearn versions:
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+r2 = r2_score(y_test, y_pred)
+
+print(f"📊 RMSE: {rmse:.3f}")
+print(f"📈 R²: {r2:.3f}")
+
+plt.figure(figsize=(7,7))
+plt.scatter(y_test, y_pred, alpha=0.5)
+plt.plot([0,100],[0,100], linestyle='--')
+plt.xlabel("Actual Usefulness Score")
+plt.ylabel("Predicted Usefulness Score")
+plt.title("Actual vs Predicted Usefulness")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "actual_vs_predicted.png"))
+plt.close()
+
+print("✅ Evaluation complete. Visuals saved in outputs/.")
+
+# -------------------------------------------
+# 8. Recommendations example
+# -------------------------------------------
+recent_prompts = df.sample(50, random_state=RANDOM_STATE).copy()
+recent_prompts["predicted_usefulness"] = model_pipeline.predict(
+    recent_prompts.drop(columns=["prompt_id", "usefulness_score"])
+)
+top_recommendations = recent_prompts.sort_values("predicted_usefulness", ascending=False).head(10)
+top_recommendations.to_csv(os.path.join(OUTPUT_DIR, "top_recommendations.csv"), index=False)
+
+print("✅ Top 10 prompt recommendations saved in outputs/.")
+print("\n🎉 Done — all outputs are in the 'outputs/' folder.")
